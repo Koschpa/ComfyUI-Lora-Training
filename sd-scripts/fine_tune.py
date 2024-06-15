@@ -2,26 +2,26 @@
 # XXX dropped option: hypernetwork training
 
 import argparse
-import gc
 import math
 import os
 from multiprocessing import Value
 import toml
 
 from tqdm import tqdm
+
 import torch
+from library.device_utils import init_ipex, clean_memory_on_device
+init_ipex()
 
-try:
-    import intel_extension_for_pytorch as ipex
-
-    if torch.xpu.is_available():
-        from library.ipex import ipex_init
-
-        ipex_init()
-except Exception:
-    pass
 from accelerate.utils import set_seed
 from diffusers import DDPMScheduler
+
+from library.utils import setup_logging, add_logging_arguments
+
+setup_logging()
+import logging
+
+logger = logging.getLogger(__name__)
 
 import library.train_util as train_util
 import library.config_util as config_util
@@ -42,6 +42,7 @@ from library.custom_train_functions import (
 def train(args):
     train_util.verify_training_args(args)
     train_util.prepare_dataset_args(args, True)
+    setup_logging(args, reset=True)
 
     cache_latents = args.cache_latents
 
@@ -54,11 +55,11 @@ def train(args):
     if args.dataset_class is None:
         blueprint_generator = BlueprintGenerator(ConfigSanitizer(False, True, False, True))
         if args.dataset_config is not None:
-            print(f"Load dataset config from {args.dataset_config}")
+            logger.info(f"Load dataset config from {args.dataset_config}")
             user_config = config_util.load_user_config(args.dataset_config)
             ignored = ["train_data_dir", "in_json"]
             if any(getattr(args, attr) is not None for attr in ignored):
-                print(
+                logger.warning(
                     "ignore following options because config file is found: {0} / 設定ファイルが利用されるため以下のオプションは無視されます: {0}".format(
                         ", ".join(ignored)
                     )
@@ -91,7 +92,7 @@ def train(args):
         train_util.debug_dataset(train_dataset_group)
         return
     if len(train_dataset_group) == 0:
-        print(
+        logger.error(
             "No data found. Please verify the metadata file and train_data_dir option. / 画像がありません。メタデータおよびtrain_data_dirオプションを確認してください。"
         )
         return
@@ -102,7 +103,7 @@ def train(args):
         ), "when caching latents, either color_aug or random_crop cannot be used / latentをキャッシュするときはcolor_augとrandom_cropは使えません"
 
     # acceleratorを準備する
-    print("prepare accelerator")
+    logger.info("prepare accelerator")
     accelerator = train_util.prepare_accelerator(args)
 
     # mixed precisionに対応した型を用意しておき適宜castする
@@ -163,9 +164,7 @@ def train(args):
         with torch.no_grad():
             train_dataset_group.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, accelerator.is_main_process)
         vae.to("cpu")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
+        clean_memory_on_device(accelerator.device)
 
         accelerator.wait_for_everyone()
 
@@ -212,8 +211,8 @@ def train(args):
     _, _, optimizer = train_util.get_optimizer(args, trainable_params=trainable_params)
 
     # dataloaderを準備する
-    # DataLoaderのプロセス数：0はメインプロセスになる
-    n_workers = min(args.max_data_loader_n_workers, os.cpu_count() - 1)  # cpu_count-1 ただし最大で指定された数まで
+    # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
+    n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset_group,
         batch_size=1,
@@ -228,7 +227,9 @@ def train(args):
         args.max_train_steps = args.max_train_epochs * math.ceil(
             len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
         )
-        accelerator.print(f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}")
+        accelerator.print(
+            f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}"
+        )
 
     # データセット側にも学習ステップを送信
     train_dataset_group.set_max_train_steps(args.max_train_steps)
@@ -252,9 +253,6 @@ def train(args):
         )
     else:
         unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(unet, optimizer, train_dataloader, lr_scheduler)
-
-    # transform DDP after prepare
-    text_encoder, unet = train_util.transform_if_model_is_DDP(text_encoder, unet)
 
     # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
     if args.full_fp16:
@@ -294,9 +292,14 @@ def train(args):
 
     if accelerator.is_main_process:
         init_kwargs = {}
+        if args.wandb_run_name:
+            init_kwargs["wandb"] = {"name": args.wandb_run_name}
         if args.log_tracker_config is not None:
             init_kwargs = toml.load(args.log_tracker_config)
         accelerator.init_trackers("finetuning" if args.log_tracker_name is None else args.log_tracker_name, init_kwargs=init_kwargs)
+
+    # For --sample_at_first
+    train_util.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
     loss_recorder = train_util.LossRecorder()
     for epoch in range(num_train_epochs):
@@ -355,7 +358,7 @@ def train(args):
                     loss = loss.mean([1, 2, 3])
 
                     if args.min_snr_gamma:
-                        loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma)
+                        loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
                     if args.scale_v_pred_loss_like_noise_pred:
                         loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
                     if args.debiased_estimation_loss:
@@ -464,12 +467,13 @@ def train(args):
         train_util.save_sd_model_on_train_end(
             args, src_path, save_stable_diffusion_format, use_safetensors, save_dtype, epoch, global_step, text_encoder, unet, vae
         )
-        print("model saved.")
+        logger.info("model saved.")
 
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
+    add_logging_arguments(parser)
     train_util.add_sd_models_arguments(parser)
     train_util.add_dataset_arguments(parser, False, True, True)
     train_util.add_training_arguments(parser, False)
@@ -478,7 +482,9 @@ def setup_parser() -> argparse.ArgumentParser:
     config_util.add_config_arguments(parser)
     custom_train_functions.add_custom_train_arguments(parser)
 
-    parser.add_argument("--diffusers_xformers", action="store_true", help="use xformers by diffusers / Diffusersでxformersを使用する")
+    parser.add_argument(
+        "--diffusers_xformers", action="store_true", help="use xformers by diffusers / Diffusersでxformersを使用する"
+    )
     parser.add_argument("--train_text_encoder", action="store_true", help="train text encoder / text encoderも学習する")
     parser.add_argument(
         "--learning_rate_te",

@@ -249,39 +249,127 @@ ControlNet-LLLite, a novel method for ControlNet with SDXL, is added. See [docum
 
 ## Change History
 
-### Nov 5, 2023 / 2023/11/5
+### Mar 15, 2024 / 2024/3/15: v0.8.5
 
-- `sdxl_train.py` now supports different learning rates for each Text Encoder.
-  - Example:
-    - `--learning_rate 1e-6`: train U-Net only
-    - `--train_text_encoder --learning_rate 1e-6`: train U-Net and two Text Encoders with the same learning rate (same as the previous version)
-    - `--train_text_encoder --learning_rate 1e-6 --learning_rate_te1 1e-6 --learning_rate_te2 1e-6`: train U-Net and two Text Encoders with the different learning rates
-    - `--train_text_encoder --learning_rate 0 --learning_rate_te1 1e-6 --learning_rate_te2 1e-6`: train two Text Encoders only 
-    - `--train_text_encoder --learning_rate 1e-6 --learning_rate_te1 1e-6 --learning_rate_te2 0`: train U-Net and one Text Encoder only
-    - `--train_text_encoder --learning_rate 0 --learning_rate_te1 0 --learning_rate_te2 1e-6`: train one Text Encoder only
+- Fixed a bug that the value of timestep embedding during SDXL training was incorrect.
+  - The inference with the generation script is also fixed.
+  - The impact is unknown, but please update for SDXL training.
 
-- `train_db.py` and `fine_tune.py` now support different learning rates for Text Encoder. Specify with `--learning_rate_te` option. 
-  - To train Text Encoder with `fine_tune.py`, specify `--train_text_encoder` option too. `train_db.py` trains Text Encoder by default.
+- SDXL 学習時の timestep embedding の値が誤っていたのを修正しました。
+  - 生成スクリプトでの推論時についてもあわせて修正しました。
+  - 影響の度合いは不明ですが、SDXL の学習時にはアップデートをお願いいたします。
 
-- Fixed the bug that Text Encoder is not trained when block lr is specified in `sdxl_train.py`.
+### Feb 24, 2024 / 2024/2/24: v0.8.4
 
-- Debiased Estimation loss is added to each training script. Thanks to sdbds!
-  - Specify `--debiased_estimation_loss` option to enable it. See PR [#889](https://github.com/kohya-ss/sd-scripts/pull/889) for details.
-- Training of Text Encoder is improved in `train_network.py` and `sdxl_train_network.py`. Thanks to KohakuBlueleaf! PR [#895](https://github.com/kohya-ss/sd-scripts/pull/895)
-- The moving average of the loss is now displayed in the progress bar in each training script. Thanks to shirayu! PR [#899](https://github.com/kohya-ss/sd-scripts/pull/899)
-- PagedAdamW32bit optimizer is supported. Specify `--optimizer_type=PagedAdamW32bit`. Thanks to xzuyn! PR [#900](https://github.com/kohya-ss/sd-scripts/pull/900)
-- Other bug fixes and improvements.
+- The log output has been improved. PR [#905](https://github.com/kohya-ss/sd-scripts/pull/905) Thanks to shirayu!
+  - The log is formatted by default. The `rich` library is required. Please see [Upgrade](#upgrade) and update the library.
+  - If `rich` is not installed, the log output will be the same as before.
+  - The following options are available in each training script:
+  - `--console_log_simple` option can be used to switch to the previous log output.
+  - `--console_log_level` option can be used to specify the log level. The default is `INFO`.
+  - `--console_log_file` option can be used to output the log to a file. The default is `None` (output to the console).
+- The sample image generation during multi-GPU training is now done with multiple GPUs. PR [#1061](https://github.com/kohya-ss/sd-scripts/pull/1061) Thanks to DKnight54!
+- The support for mps devices is improved. PR [#1054](https://github.com/kohya-ss/sd-scripts/pull/1054) Thanks to akx! If mps device exists instead of CUDA, the mps device is used automatically.
+- The `--new_conv_rank` option to specify the new rank of Conv2d is added to `networks/resize_lora.py`. PR [#1102](https://github.com/kohya-ss/sd-scripts/pull/1102) Thanks to mgz-dev!
+- An option `--highvram` to disable the optimization for environments with little VRAM is added to the training scripts. If you specify it when there is enough VRAM, the operation will be faster.
+  - Currently, only the cache part of latents is optimized.
+- The IPEX support is improved. PR [#1086](https://github.com/kohya-ss/sd-scripts/pull/1086) Thanks to Disty0!
+- Fixed a bug that `svd_merge_lora.py` crashes in some cases. PR [#1087](https://github.com/kohya-ss/sd-scripts/pull/1087) Thanks to mgz-dev!
+- DyLoRA is fixed to work with SDXL. PR [#1126](https://github.com/kohya-ss/sd-scripts/pull/1126) Thanks to tamlog06!
+- The common image generation script `gen_img.py` for SD 1/2 and SDXL is added. The basic functions are the same as the scripts for SD 1/2 and SDXL, but some new features are added.
+  - External scripts to generate prompts can be supported. It can be called with `--from_module` option. (The documentation will be added later)
+  - The normalization method after prompt weighting can be specified with `--emb_normalize_mode` option. `original` is the original method, `abs` is the normalization with the average of the absolute values, `none` is no normalization.
+- Gradual Latent Hires fix is added to each generation script. See [here](./docs/gen_img_README-ja.md#about-gradual-latent) for details.
 
-- `sdxl_train.py` で、二つのText Encoderそれぞれに独立した学習率が指定できるようになりました。サンプルは上の英語版を参照してください。
-- `train_db.py` および `fine_tune.py` で Text Encoder に別の学習率を指定できるようになりました。`--learning_rate_te` オプションで指定してください。
-  - `fine_tune.py` で Text Encoder を学習するには `--train_text_encoder` オプションをあわせて指定してください。`train_db.py` はデフォルトで学習します。
-- `sdxl_train.py` で block lr を指定すると Text Encoder が学習されない不具合を修正しました。
-- Debiased Estimation loss が各学習スクリプトに追加されました。sdbsd 氏に感謝します。
-  - `--debiased_estimation_loss` を指定すると有効になります。詳細は PR [#889](https://github.com/kohya-ss/sd-scripts/pull/889) を参照してください。
-- `train_network.py` と `sdxl_train_network.py` でText Encoderの学習が改善されました。KohakuBlueleaf 氏に感謝します。 PR [#895](https://github.com/kohya-ss/sd-scripts/pull/895)
-- 各学習スクリプトで移動平均のlossがプログレスバーに表示されるようになりました。shirayu 氏に感謝します。 PR [#899](https://github.com/kohya-ss/sd-scripts/pull/899)
-- PagedAdamW32bit オプティマイザがサポートされました。`--optimizer_type=PagedAdamW32bit` と指定してください。xzuyn 氏に感謝します。 PR [#900](https://github.com/kohya-ss/sd-scripts/pull/900)
-- その他のバグ修正と改善。
+- ログ出力が改善されました。 PR [#905](https://github.com/kohya-ss/sd-scripts/pull/905) shirayu 氏に感謝します。
+  - デフォルトでログが成形されます。`rich` ライブラリが必要なため、[Upgrade](#upgrade) を参照し更新をお願いします。
+  - `rich` がインストールされていない場合は、従来のログ出力になります。
+  - 各学習スクリプトでは以下のオプションが有効です。
+  - `--console_log_simple` オプションで従来のログ出力に切り替えられます。
+  - `--console_log_level` でログレベルを指定できます。デフォルトは `INFO` です。
+  - `--console_log_file` でログファイルを出力できます。デフォルトは `None`（コンソールに出力） です。
+- 複数 GPU 学習時に学習中のサンプル画像生成を複数 GPU で行うようになりました。 PR [#1061](https://github.com/kohya-ss/sd-scripts/pull/1061) DKnight54 氏に感謝します。
+- mps デバイスのサポートが改善されました。 PR [#1054](https://github.com/kohya-ss/sd-scripts/pull/1054) akx 氏に感謝します。CUDA ではなく mps が存在する場合には自動的に mps デバイスを使用します。
+- `networks/resize_lora.py` に Conv2d の新しいランクを指定するオプション `--new_conv_rank` が追加されました。 PR [#1102](https://github.com/kohya-ss/sd-scripts/pull/1102) mgz-dev 氏に感謝します。
+- 学習スクリプトに VRAMが少ない環境向け最適化を無効にするオプション `--highvram` を追加しました。VRAM に余裕がある場合に指定すると動作が高速化されます。
+  - 現在は latents のキャッシュ部分のみ高速化されます。
+- IPEX サポートが改善されました。 PR [#1086](https://github.com/kohya-ss/sd-scripts/pull/1086) Disty0 氏に感謝します。
+- `svd_merge_lora.py` が場合によってエラーになる不具合が修正されました。 PR [#1087](https://github.com/kohya-ss/sd-scripts/pull/1087) mgz-dev 氏に感謝します。
+- DyLoRA が SDXL で動くよう修正されました。PR [#1126](https://github.com/kohya-ss/sd-scripts/pull/1126) tamlog06 氏に感謝します。
+- SD 1/2 および SDXL 共通の生成スクリプト `gen_img.py` を追加しました。基本的な機能は SD 1/2、SDXL 向けスクリプトと同じですが、いくつかの新機能が追加されています。
+  - プロンプトを動的に生成する外部スクリプトをサポートしました。 `--from_module` で呼び出せます。（ドキュメントはのちほど追加します）
+  - プロンプト重みづけ後の正規化方法を `--emb_normalize_mode` で指定できます。`original` は元の方法、`abs` は絶対値の平均値で正規化、`none` は正規化を行いません。
+- Gradual Latent Hires fix を各生成スクリプトに追加しました。詳細は [こちら](./docs/gen_img_README-ja.md#about-gradual-latent)。
+
+
+### Jan 27, 2024 / 2024/1/27: v0.8.3
+
+- Fixed a bug that the training crashes when `--fp8_base` is specified with `--save_state`. PR [#1079](https://github.com/kohya-ss/sd-scripts/pull/1079) Thanks to feffy380!
+  - `safetensors` is updated. Please see [Upgrade](#upgrade) and update the library.
+- Fixed a bug that the training crashes when `network_multiplier` is specified with multi-GPU training. PR [#1084](https://github.com/kohya-ss/sd-scripts/pull/1084) Thanks to fireicewolf!
+- Fixed a bug that the training crashes when training ControlNet-LLLite.
+
+- `--fp8_base` 指定時に `--save_state` での保存がエラーになる不具合が修正されました。 PR [#1079](https://github.com/kohya-ss/sd-scripts/pull/1079) feffy380 氏に感謝します。
+  - `safetensors` がバージョンアップされていますので、[Upgrade](#upgrade) を参照し更新をお願いします。
+- 複数 GPU での学習時に `network_multiplier` を指定するとクラッシュする不具合が修正されました。 PR [#1084](https://github.com/kohya-ss/sd-scripts/pull/1084) fireicewolf 氏に感謝します。
+- ControlNet-LLLite の学習がエラーになる不具合を修正しました。 
+
+### Jan 23, 2024 / 2024/1/23: v0.8.2
+
+- [Experimental] The `--fp8_base` option is added to the training scripts for LoRA etc. The base model (U-Net, and Text Encoder when training modules for Text Encoder) can be trained with fp8. PR [#1057](https://github.com/kohya-ss/sd-scripts/pull/1057) Thanks to KohakuBlueleaf!
+  - Please specify `--fp8_base` in `train_network.py` or `sdxl_train_network.py`.
+  - PyTorch 2.1 or later is required.
+  - If you use xformers with PyTorch 2.1, please see [xformers repository](https://github.com/facebookresearch/xformers) and install the appropriate version according to your CUDA version.
+  - The sample image generation during training consumes a lot of memory. It is recommended to turn it off.
+
+- [Experimental] The network multiplier can be specified for each dataset in the training scripts for LoRA etc.
+  - This is an experimental option and may be removed or changed in the future.
+  - For example, if you train with state A as `1.0` and state B as `-1.0`, you may be able to generate by switching between state A and B depending on the LoRA application rate.
+  - Also, if you prepare five states and train them as `0.2`, `0.4`, `0.6`, `0.8`, and `1.0`, you may be able to generate by switching the states smoothly depending on the application rate.
+  - Please specify `network_multiplier` in `[[datasets]]` in `.toml` file.
+- Some options are added to `networks/extract_lora_from_models.py` to reduce the memory usage.
+  - `--load_precision` option can be used to specify the precision when loading the model. If the model is saved in fp16, you can reduce the memory usage by specifying `--load_precision fp16` without losing precision.
+  - `--load_original_model_to` option can be used to specify the device to load the original model. `--load_tuned_model_to` option can be used to specify the device to load the derived model. The default is `cpu` for both options, but you can specify `cuda` etc. You can reduce the memory usage by loading one of them to GPU. This option is available only for SDXL.
+
+- The gradient synchronization in LoRA training with multi-GPU is improved. PR [#1064](https://github.com/kohya-ss/sd-scripts/pull/1064) Thanks to KohakuBlueleaf!
+- The code for Intel IPEX support is improved. PR [#1060](https://github.com/kohya-ss/sd-scripts/pull/1060) Thanks to akx!
+- Fixed a bug in multi-GPU Textual Inversion training.
+
+- （実験的）　LoRA等の学習スクリプトで、ベースモデル（U-Net、および Text Encoder のモジュール学習時は Text Encoder も）の重みを fp8 にして学習するオプションが追加されました。 PR [#1057](https://github.com/kohya-ss/sd-scripts/pull/1057) KohakuBlueleaf 氏に感謝します。
+  - `train_network.py` または `sdxl_train_network.py` で `--fp8_base` を指定してください。
+  - PyTorch 2.1 以降が必要です。
+  - PyTorch 2.1 で xformers を使用する場合は、[xformers のリポジトリ](https://github.com/facebookresearch/xformers) を参照し、CUDA バージョンに応じて適切なバージョンをインストールしてください。
+  - 学習中のサンプル画像生成はメモリを大量に消費するため、オフにすることをお勧めします。
+- (実験的)　LoRA 等の学習で、データセットごとに異なるネットワーク適用率を指定できるようになりました。 
+  - 実験的オプションのため、将来的に削除または仕様変更される可能性があります。
+  - たとえば状態 A を `1.0`、状態 B を `-1.0` として学習すると、LoRA の適用率に応じて状態 A と B を切り替えつつ生成できるかもしれません。
+  - また、五段階の状態を用意し、それぞれ `0.2`、`0.4`、`0.6`、`0.8`、`1.0` として学習すると、適用率でなめらかに状態を切り替えて生成できるかもしれません。 
+  - `.toml` ファイルで `[[datasets]]` に `network_multiplier` を指定してください。
+- `networks/extract_lora_from_models.py` に使用メモリ量を削減するいくつかのオプションを追加しました。 
+  - `--load_precision` で読み込み時の精度を指定できます。モデルが fp16 で保存されている場合は `--load_precision fp16` を指定して精度を変えずにメモリ量を削減できます。
+  - `--load_original_model_to` で元モデルを読み込むデバイスを、`--load_tuned_model_to` で派生モデルを読み込むデバイスを指定できます。デフォルトは両方とも `cpu` ですがそれぞれ `cuda` 等を指定できます。片方を GPU に読み込むことでメモリ量を削減できます。SDXL の場合のみ有効です。
+- マルチ GPU での LoRA 等の学習時に勾配の同期が改善されました。 PR [#1064](https://github.com/kohya-ss/sd-scripts/pull/1064) KohakuBlueleaf 氏に感謝します。
+- Intel IPEX サポートのコードが改善されました。PR [#1060](https://github.com/kohya-ss/sd-scripts/pull/1060) akx 氏に感謝します。
+- マルチ GPU での Textual Inversion 学習の不具合を修正しました。
+
+- `.toml` example for network multiplier / ネットワーク適用率の `.toml` の記述例
+
+```toml
+[general]
+[[datasets]]
+resolution = 512
+batch_size = 8
+network_multiplier = 1.0
+
+... subset settings ...
+
+[[datasets]]
+resolution = 512
+batch_size = 8
+network_multiplier = -1.0
+
+... subset settings ...
+```
 
 
 Please read [Releases](https://github.com/kohya-ss/sd-scripts/releases) for recent updates.

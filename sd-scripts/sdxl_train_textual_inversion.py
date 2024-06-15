@@ -2,14 +2,11 @@ import argparse
 import os
 
 import regex
+
 import torch
-try:
-    import intel_extension_for_pytorch as ipex
-    if torch.xpu.is_available():
-        from library.ipex import ipex_init
-        ipex_init()
-except Exception:
-    pass
+from library.device_utils import init_ipex
+init_ipex()
+
 import open_clip
 from library import sdxl_model_util, sdxl_train_util, train_util
 
@@ -64,6 +61,7 @@ class SdxlTextualInversionTrainer(train_textual_inversion.TextualInversionTraine
                 text_encoders[0],
                 text_encoders[1],
                 None if not args.full_fp16 else weight_dtype,
+                accelerator=accelerator,
             )
         return encoder_hidden_states1, encoder_hidden_states2, pool2
 

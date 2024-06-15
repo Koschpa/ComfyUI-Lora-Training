@@ -64,17 +64,11 @@ import re
 
 import diffusers
 import numpy as np
+
 import torch
+from library.device_utils import init_ipex, clean_memory, get_preferred_device
+init_ipex()
 
-try:
-    import intel_extension_for_pytorch as ipex
-
-    if torch.xpu.is_available():
-        from library.ipex import ipex_init
-
-        ipex_init()
-except Exception:
-    pass
 import torchvision
 from diffusers import (
     AutoencoderKL,
@@ -105,10 +99,17 @@ import library.train_util as train_util
 from networks.lora import LoRANetwork
 import tools.original_control_net as original_control_net
 from tools.original_control_net import ControlNetInfo
-from library.original_unet import UNet2DConditionModel
+from library.original_unet import UNet2DConditionModel, InferUNet2DConditionModel
 from library.original_unet import FlashAttentionFunction
+from library.utils import GradualLatent, EulerAncestralDiscreteSchedulerGL
 
 from XTI_hijack import unet_forward_XTI, downblock_forward_XTI, upblock_forward_XTI
+from library.utils import setup_logging, add_logging_arguments
+
+setup_logging()
+import logging
+
+logger = logging.getLogger(__name__)
 
 # scheduler:
 SCHEDULER_LINEAR_START = 0.00085
@@ -144,12 +145,12 @@ USE_CUTOUTS = False
 
 def replace_unet_modules(unet: diffusers.models.unet_2d_condition.UNet2DConditionModel, mem_eff_attn, xformers, sdpa):
     if mem_eff_attn:
-        print("Enable memory efficient attention for U-Net")
+        logger.info("Enable memory efficient attention for U-Net")
 
         # これはDiffusersのU-Netではなく自前のU-Netなので置き換えなくても良い
         unet.set_use_memory_efficient_attention(False, True)
     elif xformers:
-        print("Enable xformers for U-Net")
+        logger.info("Enable xformers for U-Net")
         try:
             import xformers.ops
         except ImportError:
@@ -157,7 +158,7 @@ def replace_unet_modules(unet: diffusers.models.unet_2d_condition.UNet2DConditio
 
         unet.set_use_memory_efficient_attention(True, False)
     elif sdpa:
-        print("Enable SDPA for U-Net")
+        logger.info("Enable SDPA for U-Net")
         unet.set_use_memory_efficient_attention(False, False)
         unet.set_use_sdpa(True)
 
@@ -173,7 +174,7 @@ def replace_vae_modules(vae: diffusers.models.AutoencoderKL, mem_eff_attn, xform
 
 
 def replace_vae_attn_to_memory_efficient():
-    print("VAE Attention.forward has been replaced to FlashAttention (not xformers)")
+    logger.info("VAE Attention.forward has been replaced to FlashAttention (not xformers)")
     flash_func = FlashAttentionFunction
 
     def forward_flash_attn(self, hidden_states, **kwargs):
@@ -229,7 +230,7 @@ def replace_vae_attn_to_memory_efficient():
 
 
 def replace_vae_attn_to_xformers():
-    print("VAE: Attention.forward has been replaced to xformers")
+    logger.info("VAE: Attention.forward has been replaced to xformers")
     import xformers.ops
 
     def forward_xformers(self, hidden_states, **kwargs):
@@ -285,7 +286,7 @@ def replace_vae_attn_to_xformers():
 
 
 def replace_vae_attn_to_sdpa():
-    print("VAE: Attention.forward has been replaced to sdpa")
+    logger.info("VAE: Attention.forward has been replaced to sdpa")
 
     def forward_sdpa(self, hidden_states, **kwargs):
         residual = hidden_states
@@ -378,7 +379,7 @@ class PipelineLike:
         vae: AutoencoderKL,
         text_encoder: CLIPTextModel,
         tokenizer: CLIPTokenizer,
-        unet: UNet2DConditionModel,
+        unet: InferUNet2DConditionModel,
         scheduler: Union[DDIMScheduler, PNDMScheduler, LMSDiscreteScheduler],
         clip_skip: int,
         clip_model: CLIPModel,
@@ -454,6 +455,8 @@ class PipelineLike:
         self.control_nets: List[ControlNetInfo] = []
         self.control_net_enabled = True  # control_netsが空ならTrueでもFalseでもControlNetは動作しない
 
+        self.gradual_latent: GradualLatent = None
+
     # Textual Inversion
     def add_token_replacement(self, target_token_id, rep_token_ids):
         self.token_replacements[target_token_id] = rep_token_ids
@@ -483,6 +486,14 @@ class PipelineLike:
 
     def set_control_nets(self, ctrl_nets):
         self.control_nets = ctrl_nets
+
+    def set_gradual_latent(self, gradual_latent):
+        if gradual_latent is None:
+            logger.info("gradual_latent is disabled")
+            self.gradual_latent = None
+        else:
+            logger.info(f"gradual_latent is enabled: {gradual_latent}")
+            self.gradual_latent = gradual_latent  # (ds_ratio, start_timesteps, every_n_steps, ratio_step)
 
     # region xformersとか使う部分：独自に書き換えるので関係なし
 
@@ -689,7 +700,7 @@ class PipelineLike:
         do_classifier_free_guidance = guidance_scale > 1.0
 
         if not do_classifier_free_guidance and negative_scale is not None:
-            print(f"negative_scale is ignored if guidance scalle <= 1.0")
+            logger.warning(f"negative_scale is ignored if guidance scalle <= 1.0")
             negative_scale = None
 
         # get unconditional embeddings for classifier free guidance
@@ -771,11 +782,11 @@ class PipelineLike:
             clip_text_input = prompt_tokens
             if clip_text_input.shape[1] > self.tokenizer.model_max_length:
                 # TODO 75文字を超えたら警告を出す？
-                print("trim text input", clip_text_input.shape)
+                logger.info(f"trim text input {clip_text_input.shape}")
                 clip_text_input = torch.cat(
                     [clip_text_input[:, : self.tokenizer.model_max_length - 1], clip_text_input[:, -1].unsqueeze(1)], dim=1
                 )
-                print("trimmed", clip_text_input.shape)
+                logger.info(f"trimmed {clip_text_input.shape}")
 
             for i, clip_prompt in enumerate(clip_prompts):
                 if clip_prompt is not None:  # clip_promptがあれば上書きする
@@ -893,8 +904,7 @@ class PipelineLike:
                     init_latent_dist = self.vae.encode(init_image).latent_dist
                     init_latents = init_latent_dist.sample(generator=generator)
                 else:
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    clean_memory()
                     init_latents = []
                     for i in tqdm(range(0, min(batch_size, len(init_image)), vae_batch_size)):
                         init_latent_dist = self.vae.encode(
@@ -958,7 +968,49 @@ class PipelineLike:
         else:
             text_emb_last = text_embeddings
 
+        enable_gradual_latent = False
+        if self.gradual_latent:
+            if not hasattr(self.scheduler, "set_gradual_latent_params"):
+                logger.info("gradual_latent is not supported for this scheduler. Ignoring.")
+                logger.info(f'{self.scheduler.__class__.__name__}')
+            else:
+                enable_gradual_latent = True
+                step_elapsed = 1000
+                current_ratio = self.gradual_latent.ratio
+
+                # first, we downscale the latents to the specified ratio / 最初に指定された比率にlatentsをダウンスケールする
+                height, width = latents.shape[-2:]
+                org_dtype = latents.dtype
+                if org_dtype == torch.bfloat16:
+                    latents = latents.float()
+                latents = torch.nn.functional.interpolate(
+                    latents, scale_factor=current_ratio, mode="bicubic", align_corners=False
+                ).to(org_dtype)
+
+                # apply unsharp mask / アンシャープマスクを適用する
+                if self.gradual_latent.gaussian_blur_ksize:
+                    latents = self.gradual_latent.apply_unshark_mask(latents)
+
         for i, t in enumerate(tqdm(timesteps)):
+            resized_size = None
+            if enable_gradual_latent:
+                # gradually upscale the latents / latentsを徐々にアップスケールする
+                if (
+                    t < self.gradual_latent.start_timesteps
+                    and current_ratio < 1.0
+                    and step_elapsed >= self.gradual_latent.every_n_steps
+                ):
+                    current_ratio = min(current_ratio + self.gradual_latent.ratio_step, 1.0)
+                    # make divisible by 8 because size of latents must be divisible at bottom of UNet
+                    h = int(height * current_ratio) // 8 * 8
+                    w = int(width * current_ratio) // 8 * 8
+                    resized_size = (h, w)
+                    self.scheduler.set_gradual_latent_params(resized_size, self.gradual_latent)
+                    step_elapsed = 0
+                else:
+                    self.scheduler.set_gradual_latent_params(None, None)
+                step_elapsed += 1
+
             # expand the latents if we are doing classifier free guidance
             latent_model_input = latents.repeat((num_latent_input, 1, 1, 1))
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
@@ -1052,8 +1104,7 @@ class PipelineLike:
         if vae_batch_size >= batch_size:
             image = self.vae.decode(latents).sample
         else:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            clean_memory()
             images = []
             for i in tqdm(range(0, batch_size, vae_batch_size)):
                 images.append(
@@ -1540,7 +1591,9 @@ class PipelineLike:
         image_embeddings = self.vgg16_feat_model(image)["feat"]
 
         # バッチサイズが複数だと正しく動くかわからない
-        loss = ((image_embeddings - guide_embeddings) ** 2).mean() * guidance_scale  # MSE style transferでコンテンツの損失はMSEなので
+        loss = (
+            (image_embeddings - guide_embeddings) ** 2
+        ).mean() * guidance_scale  # MSE style transferでコンテンツの損失はMSEなので
 
         grads = -torch.autograd.grad(loss, latents)[0]
         if isinstance(self.scheduler, LMSDiscreteScheduler):
@@ -1704,7 +1757,7 @@ def get_prompts_with_weights(pipe: PipelineLike, prompt: List[str], max_length: 
             if word.strip() == "BREAK":
                 # pad until next multiple of tokenizer's max token length
                 pad_len = pipe.tokenizer.model_max_length - (len(text_token) % pipe.tokenizer.model_max_length)
-                print(f"BREAK pad_len: {pad_len}")
+                logger.info(f"BREAK pad_len: {pad_len}")
                 for i in range(pad_len):
                     # v2のときEOSをつけるべきかどうかわからないぜ
                     # if i == 0:
@@ -1734,7 +1787,7 @@ def get_prompts_with_weights(pipe: PipelineLike, prompt: List[str], max_length: 
         tokens.append(text_token)
         weights.append(text_weight)
     if truncated:
-        print("warning: Prompt was truncated. Try to shorten the prompt or increase max_embeddings_multiples")
+        logger.warning("Prompt was truncated. Try to shorten the prompt or increase max_embeddings_multiples")
     return tokens, weights
 
 
@@ -2046,7 +2099,7 @@ def handle_dynamic_prompt_variants(prompt, repeat_count):
             elif len(count_range) == 2:
                 count_range = [int(count_range[0]), int(count_range[1])]
             else:
-                print(f"invalid count range: {count_range}")
+                logger.warning(f"invalid count range: {count_range}")
                 count_range = [1, 1]
             if count_range[0] > count_range[1]:
                 count_range = [count_range[1], count_range[0]]
@@ -2116,7 +2169,7 @@ def handle_dynamic_prompt_variants(prompt, repeat_count):
 
 
 # def load_clip_l14_336(dtype):
-#   print(f"loading CLIP: {CLIP_ID_L14_336}")
+#   logger.info(f"loading CLIP: {CLIP_ID_L14_336}")
 #   text_encoder = CLIPTextModel.from_pretrained(CLIP_ID_L14_336, torch_dtype=dtype)
 #   return text_encoder
 
@@ -2131,6 +2184,7 @@ class BatchDataBase(NamedTuple):
     mask_image: Any
     clip_prompt: str
     guide_image: Any
+    raw_prompt: str
 
 
 class BatchDataExt(NamedTuple):
@@ -2163,9 +2217,9 @@ def main(args):
     # assert not highres_fix or args.image_path is None, f"highres_fix doesn't work with img2img / highres_fixはimg2imgと同時に使えません"
 
     if args.v_parameterization and not args.v2:
-        print("v_parameterization should be with v2 / v1でv_parameterizationを使用することは想定されていません")
+        logger.warning("v_parameterization should be with v2 / v1でv_parameterizationを使用することは想定されていません")
     if args.v2 and args.clip_skip is not None:
-        print("v2 with clip_skip will be unexpected / v2でclip_skipを使用することは想定されていません")
+        logger.warning("v2 with clip_skip will be unexpected / v2でclip_skipを使用することは想定されていません")
 
     # モデルを読み込む
     if not os.path.isfile(args.ckpt):  # ファイルがないならパターンで探し、一つだけ該当すればそれを使う
@@ -2175,10 +2229,10 @@ def main(args):
 
     use_stable_diffusion_format = os.path.isfile(args.ckpt)
     if use_stable_diffusion_format:
-        print("load StableDiffusion checkpoint")
+        logger.info("load StableDiffusion checkpoint")
         text_encoder, vae, unet = model_util.load_models_from_stable_diffusion_checkpoint(args.v2, args.ckpt)
     else:
-        print("load Diffusers pretrained models")
+        logger.info("load Diffusers pretrained models")
         loading_pipe = StableDiffusionPipeline.from_pretrained(args.ckpt, safety_checker=None, torch_dtype=dtype)
         text_encoder = loading_pipe.text_encoder
         vae = loading_pipe.vae
@@ -2196,25 +2250,26 @@ def main(args):
         )
         original_unet.load_state_dict(unet.state_dict())
         unet = original_unet
+    unet: InferUNet2DConditionModel = InferUNet2DConditionModel(unet)
 
     # VAEを読み込む
     if args.vae is not None:
         vae = model_util.load_vae(args.vae, dtype)
-        print("additional VAE loaded")
+        logger.info("additional VAE loaded")
 
     # # 置換するCLIPを読み込む
     # if args.replace_clip_l14_336:
     #   text_encoder = load_clip_l14_336(dtype)
-    #   print(f"large clip {CLIP_ID_L14_336} is loaded")
+    #   logger.info(f"large clip {CLIP_ID_L14_336} is loaded")
 
     if args.clip_guidance_scale > 0.0 or args.clip_image_guidance_scale:
-        print("prepare clip model")
+        logger.info("prepare clip model")
         clip_model = CLIPModel.from_pretrained(CLIP_MODEL_PATH, torch_dtype=dtype)
     else:
         clip_model = None
 
     if args.vgg16_guidance_scale > 0.0:
-        print("prepare resnet model")
+        logger.info("prepare resnet model")
         vgg16_model = torchvision.models.vgg16(torchvision.models.VGG16_Weights.IMAGENET1K_V1)
     else:
         vgg16_model = None
@@ -2226,7 +2281,7 @@ def main(args):
         replace_vae_modules(vae, mem_eff, args.xformers, args.sdpa)
 
     # tokenizerを読み込む
-    print("loading tokenizer")
+    logger.info("loading tokenizer")
     if use_stable_diffusion_format:
         tokenizer = train_util.load_tokenizer(args)
 
@@ -2249,7 +2304,7 @@ def main(args):
         scheduler_cls = EulerDiscreteScheduler
         scheduler_module = diffusers.schedulers.scheduling_euler_discrete
     elif args.sampler == "euler_a" or args.sampler == "k_euler_a":
-        scheduler_cls = EulerAncestralDiscreteScheduler
+        scheduler_cls = EulerAncestralDiscreteSchedulerGL
         scheduler_module = diffusers.schedulers.scheduling_euler_ancestral_discrete
     elif args.sampler == "dpmsolver" or args.sampler == "dpmsolver++":
         scheduler_cls = DPMSolverMultistepScheduler
@@ -2285,7 +2340,7 @@ def main(args):
             self.sampler_noises = noises
 
         def randn(self, shape, device=None, dtype=None, layout=None, generator=None):
-            # print("replacing", shape, len(self.sampler_noises), self.sampler_noise_index)
+            # logger.info(f"replacing {shape} {len(self.sampler_noises)} {self.sampler_noise_index}")
             if self.sampler_noises is not None and self.sampler_noise_index < len(self.sampler_noises):
                 noise = self.sampler_noises[self.sampler_noise_index]
                 if shape != noise.shape:
@@ -2294,7 +2349,7 @@ def main(args):
                 noise = None
 
             if noise == None:
-                print(f"unexpected noise request: {self.sampler_noise_index}, {shape}")
+                logger.warning(f"unexpected noise request: {self.sampler_noise_index}, {shape}")
                 noise = torch.randn(shape, dtype=dtype, device=device, generator=generator)
 
             self.sampler_noise_index += 1
@@ -2325,11 +2380,11 @@ def main(args):
 
     # clip_sample=Trueにする
     if hasattr(scheduler.config, "clip_sample") and scheduler.config.clip_sample is False:
-        print("set clip_sample to True")
+        logger.info("set clip_sample to True")
         scheduler.config.clip_sample = True
 
     # deviceを決定する
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # "mps"を考量してない
+    device = get_preferred_device()
 
     # custom pipelineをコピったやつを生成する
     if args.vae_slices:
@@ -2352,13 +2407,20 @@ def main(args):
         vae = sli_vae
         del sli_vae
     vae.to(dtype).to(device)
+    vae.eval()
 
     text_encoder.to(dtype).to(device)
     unet.to(dtype).to(device)
+
+    text_encoder.eval()
+    unet.eval()
+
     if clip_model is not None:
         clip_model.to(dtype).to(device)
+        clip_model.eval()
     if vgg16_model is not None:
         vgg16_model.to(dtype).to(device)
+        vgg16_model.eval()
 
     # networkを組み込む
     if args.network_module:
@@ -2375,7 +2437,7 @@ def main(args):
             network_merge = 0
 
         for i, network_module in enumerate(args.network_module):
-            print("import network module:", network_module)
+            logger.info(f"import network module: {network_module}")
             imported_module = importlib.import_module(network_module)
 
             network_mul = 1.0 if args.network_mul is None or len(args.network_mul) <= i else args.network_mul[i]
@@ -2393,7 +2455,7 @@ def main(args):
                 raise ValueError("No weight. Weight is required.")
 
             network_weight = args.network_weights[i]
-            print("load network weights from:", network_weight)
+            logger.info(f"load network weights from: {network_weight}")
 
             if model_util.is_safetensors(network_weight) and args.network_show_meta:
                 from safetensors.torch import safe_open
@@ -2401,7 +2463,7 @@ def main(args):
                 with safe_open(network_weight, framework="pt") as f:
                     metadata = f.metadata()
                 if metadata is not None:
-                    print(f"metadata for: {network_weight}: {metadata}")
+                    logger.info(f"metadata for: {network_weight}: {metadata}")
 
             network, weights_sd = imported_module.create_network_from_weights(
                 network_mul, network_weight, vae, text_encoder, unet, for_inference=True, **net_kwargs
@@ -2411,20 +2473,20 @@ def main(args):
 
             mergeable = network.is_mergeable()
             if network_merge and not mergeable:
-                print("network is not mergiable. ignore merge option.")
+                logger.warning("network is not mergiable. ignore merge option.")
 
             if not mergeable or i >= network_merge:
                 # not merging
                 network.apply_to(text_encoder, unet)
                 info = network.load_state_dict(weights_sd, False)  # network.load_weightsを使うようにするとよい
-                print(f"weights are loaded: {info}")
+                logger.info(f"weights are loaded: {info}")
 
                 if args.opt_channels_last:
                     network.to(memory_format=torch.channels_last)
                 network.to(dtype).to(device)
 
                 if network_pre_calc:
-                    print("backup original weights")
+                    logger.info("backup original weights")
                     network.backup_weights()
 
                 networks.append(network)
@@ -2438,7 +2500,7 @@ def main(args):
     # upscalerの指定があれば取得する
     upscaler = None
     if args.highres_fix_upscaler:
-        print("import upscaler module:", args.highres_fix_upscaler)
+        logger.info(f"import upscaler module {args.highres_fix_upscaler}")
         imported_module = importlib.import_module(args.highres_fix_upscaler)
 
         us_kwargs = {}
@@ -2447,7 +2509,7 @@ def main(args):
                 key, value = net_arg.split("=")
                 us_kwargs[key] = value
 
-        print("create upscaler")
+        logger.info("create upscaler")
         upscaler = imported_module.create_upscaler(**us_kwargs)
         upscaler.to(dtype).to(device)
 
@@ -2464,7 +2526,7 @@ def main(args):
             control_nets.append(ControlNetInfo(ctrl_unet, ctrl_net, prep, weight, ratio))
 
     if args.opt_channels_last:
-        print(f"set optimizing: channels last")
+        logger.info(f"set optimizing: channels last")
         text_encoder.to(memory_format=torch.channels_last)
         vae.to(memory_format=torch.channels_last)
         unet.to(memory_format=torch.channels_last)
@@ -2496,7 +2558,7 @@ def main(args):
         args.vgg16_guidance_layer,
     )
     pipe.set_control_nets(control_nets)
-    print("pipeline is ready.")
+    logger.info("pipeline is ready.")
 
     if args.diffusers_xformers:
         pipe.enable_xformers_memory_efficient_attention()
@@ -2504,6 +2566,29 @@ def main(args):
     # Deep Shrink
     if args.ds_depth_1 is not None:
         unet.set_deep_shrink(args.ds_depth_1, args.ds_timesteps_1, args.ds_depth_2, args.ds_timesteps_2, args.ds_ratio)
+
+    # Gradual Latent
+    if args.gradual_latent_timesteps is not None:
+        if args.gradual_latent_unsharp_params:
+            us_params = args.gradual_latent_unsharp_params.split(",")
+            us_ksize, us_sigma, us_strength = [float(v) for v in us_params[:3]]
+            us_target_x = True if len(us_params) <= 3 else bool(int(us_params[3]))
+            us_ksize = int(us_ksize)
+        else:
+            us_ksize, us_sigma, us_strength, us_target_x = None, None, None, None
+
+        gradual_latent = GradualLatent(
+            args.gradual_latent_ratio,
+            args.gradual_latent_timesteps,
+            args.gradual_latent_every_n_steps,
+            args.gradual_latent_ratio_step,
+            args.gradual_latent_s_noise,
+            us_ksize,
+            us_sigma,
+            us_strength,
+            us_target_x,
+        )
+        pipe.set_gradual_latent(gradual_latent)
 
     # Extended Textual Inversion および Textual Inversionを処理する
     if args.XTI_embeddings:
@@ -2526,7 +2611,9 @@ def main(args):
             embeds = next(iter(data.values()))
 
             if type(embeds) != torch.Tensor:
-                raise ValueError(f"weight file does not contains Tensor / 重みファイルのデータがTensorではありません: {embeds_file}")
+                raise ValueError(
+                    f"weight file does not contains Tensor / 重みファイルのデータがTensorではありません: {embeds_file}"
+                )
 
             num_vectors_per_token = embeds.size()[0]
             token_string = os.path.splitext(os.path.basename(embeds_file))[0]
@@ -2539,7 +2626,7 @@ def main(args):
             ), f"tokenizer has same word to token string (filename). please rename the file / 指定した名前（ファイル名）のトークンが既に存在します。ファイルをリネームしてください: {embeds_file}"
 
             token_ids = tokenizer.convert_tokens_to_ids(token_strings)
-            print(f"Textual Inversion embeddings `{token_string}` loaded. Tokens are added: {token_ids}")
+            logger.info(f"Textual Inversion embeddings `{token_string}` loaded. Tokens are added: {token_ids}")
             assert (
                 min(token_ids) == token_ids[0] and token_ids[-1] == token_ids[0] + len(token_ids) - 1
             ), f"token ids is not ordered"
@@ -2598,7 +2685,7 @@ def main(args):
             ), f"tokenizer has same word to token string (filename). please rename the file / 指定した名前（ファイル名）のトークンが既に存在します。ファイルをリネームしてください: {embeds_file}"
 
             token_ids = tokenizer.convert_tokens_to_ids(token_strings)
-            print(f"XTI embeddings `{token_string}` loaded. Tokens are added: {token_ids}")
+            logger.info(f"XTI embeddings `{token_string}` loaded. Tokens are added: {token_ids}")
 
             # if num_vectors_per_token > 1:
             pipe.add_token_replacement(token_ids[0], token_ids)
@@ -2623,10 +2710,10 @@ def main(args):
 
     # promptを取得する
     if args.from_file is not None:
-        print(f"reading prompts from {args.from_file}")
+        logger.info(f"reading prompts from {args.from_file}")
         with open(args.from_file, "r", encoding="utf-8") as f:
             prompt_list = f.read().splitlines()
-            prompt_list = [d for d in prompt_list if len(d.strip()) > 0]
+            prompt_list = [d for d in prompt_list if len(d.strip()) > 0 and d[0] != "#"]
     elif args.prompt is not None:
         prompt_list = [args.prompt]
     else:
@@ -2652,7 +2739,7 @@ def main(args):
         for p in paths:
             image = Image.open(p)
             if image.mode != "RGB":
-                print(f"convert image to RGB from {image.mode}: {p}")
+                logger.info(f"convert image to RGB from {image.mode}: {p}")
                 image = image.convert("RGB")
             images.append(image)
 
@@ -2668,24 +2755,24 @@ def main(args):
         return resized
 
     if args.image_path is not None:
-        print(f"load image for img2img: {args.image_path}")
+        logger.info(f"load image for img2img: {args.image_path}")
         init_images = load_images(args.image_path)
         assert len(init_images) > 0, f"No image / 画像がありません: {args.image_path}"
-        print(f"loaded {len(init_images)} images for img2img")
+        logger.info(f"loaded {len(init_images)} images for img2img")
     else:
         init_images = None
 
     if args.mask_path is not None:
-        print(f"load mask for inpainting: {args.mask_path}")
+        logger.info(f"load mask for inpainting: {args.mask_path}")
         mask_images = load_images(args.mask_path)
         assert len(mask_images) > 0, f"No mask image / マスク画像がありません: {args.image_path}"
-        print(f"loaded {len(mask_images)} mask images for inpainting")
+        logger.info(f"loaded {len(mask_images)} mask images for inpainting")
     else:
         mask_images = None
 
     # promptがないとき、画像のPngInfoから取得する
     if init_images is not None and len(prompt_list) == 0 and not args.interactive:
-        print("get prompts from images' meta data")
+        logger.info("get prompts from images' meta data")
         for img in init_images:
             if "prompt" in img.text:
                 prompt = img.text["prompt"]
@@ -2714,17 +2801,17 @@ def main(args):
             h = int(h * args.highres_fix_scale + 0.5)
 
         if init_images is not None:
-            print(f"resize img2img source images to {w}*{h}")
+            logger.info(f"resize img2img source images to {w}*{h}")
             init_images = resize_images(init_images, (w, h))
         if mask_images is not None:
-            print(f"resize img2img mask images to {w}*{h}")
+            logger.info(f"resize img2img mask images to {w}*{h}")
             mask_images = resize_images(mask_images, (w, h))
 
     regional_network = False
     if networks and mask_images:
         # mask を領域情報として流用する、現在は一回のコマンド呼び出しで1枚だけ対応
         regional_network = True
-        print("use mask as region")
+        logger.info("use mask as region")
 
         size = None
         for i, network in enumerate(networks):
@@ -2749,14 +2836,16 @@ def main(args):
 
     prev_image = None  # for VGG16 guided
     if args.guide_image_path is not None:
-        print(f"load image for CLIP/VGG16/ControlNet guidance: {args.guide_image_path}")
+        logger.info(f"load image for CLIP/VGG16/ControlNet guidance: {args.guide_image_path}")
         guide_images = []
         for p in args.guide_image_path:
             guide_images.extend(load_images(p))
 
-        print(f"loaded {len(guide_images)} guide images for guidance")
+        logger.info(f"loaded {len(guide_images)} guide images for guidance")
         if len(guide_images) == 0:
-            print(f"No guide image, use previous generated image. / ガイド画像がありません。直前に生成した画像を使います: {args.image_path}")
+            logger.info(
+                f"No guide image, use previous generated image. / ガイド画像がありません。直前に生成した画像を使います: {args.image_path}"
+            )
             guide_images = None
     else:
         guide_images = None
@@ -2782,7 +2871,7 @@ def main(args):
     max_embeddings_multiples = 1 if args.max_embeddings_multiples is None else args.max_embeddings_multiples
 
     for gen_iter in range(args.n_iter):
-        print(f"iteration {gen_iter+1}/{args.n_iter}")
+        logger.info(f"iteration {gen_iter+1}/{args.n_iter}")
         iter_seed = random.randint(0, 0x7FFFFFFF)
 
         # shuffle prompt list
@@ -2798,7 +2887,7 @@ def main(args):
                 # 1st stageのバッチを作成して呼び出す：サイズを小さくして呼び出す
                 is_1st_latent = upscaler.support_latents() if upscaler else args.highres_fix_latents_upscaling
 
-                print("process 1st stage")
+                logger.info("process 1st stage")
                 batch_1st = []
                 for _, base, ext in batch:
                     width_1st = int(ext.width * args.highres_fix_scale + 0.5)
@@ -2824,7 +2913,7 @@ def main(args):
                 images_1st = process_batch(batch_1st, True, True)
 
                 # 2nd stageのバッチを作成して以下処理する
-                print("process 2nd stage")
+                logger.info("process 2nd stage")
                 width_2nd, height_2nd = batch[0].ext.width, batch[0].ext.height
 
                 if upscaler:
@@ -2870,13 +2959,14 @@ def main(args):
             # このバッチの情報を取り出す
             (
                 return_latents,
-                (step_first, _, _, _, init_image, mask_image, _, guide_image),
+                (step_first, _, _, _, init_image, mask_image, _, guide_image, _),
                 (width, height, steps, scale, negative_scale, strength, network_muls, num_sub_prompts),
             ) = batch[0]
             noise_shape = (LATENT_CHANNELS, height // DOWNSAMPLING_FACTOR, width // DOWNSAMPLING_FACTOR)
 
             prompts = []
             negative_prompts = []
+            raw_prompts = []
             start_code = torch.zeros((batch_size, *noise_shape), device=device, dtype=dtype)
             noises = [
                 torch.zeros((batch_size, *noise_shape), device=device, dtype=dtype)
@@ -2907,11 +2997,16 @@ def main(args):
             all_images_are_same = True
             all_masks_are_same = True
             all_guide_images_are_same = True
-            for i, (_, (_, prompt, negative_prompt, seed, init_image, mask_image, clip_prompt, guide_image), _) in enumerate(batch):
+            for i, (
+                _,
+                (_, prompt, negative_prompt, seed, init_image, mask_image, clip_prompt, guide_image, raw_prompt),
+                _,
+            ) in enumerate(batch):
                 prompts.append(prompt)
                 negative_prompts.append(negative_prompt)
                 seeds.append(seed)
                 clip_prompts.append(clip_prompt)
+                raw_prompts.append(raw_prompt)
 
                 if init_image is not None:
                     init_images.append(init_image)
@@ -2975,7 +3070,7 @@ def main(args):
                         n.restore_weights()
                     for n in networks:
                         n.pre_calculation()
-                    print("pre-calculation... done")
+                    logger.info("pre-calculation... done")
 
             images = pipe(
                 prompts,
@@ -3003,8 +3098,8 @@ def main(args):
             # save image
             highres_prefix = ("0" if highres_1st else "1") if highres_fix else ""
             ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
-            for i, (image, prompt, negative_prompts, seed, clip_prompt) in enumerate(
-                zip(images, prompts, negative_prompts, seeds, clip_prompts)
+            for i, (image, prompt, negative_prompts, seed, clip_prompt, raw_prompt) in enumerate(
+                zip(images, prompts, negative_prompts, seeds, clip_prompts, raw_prompts)
             ):
                 if highres_fix:
                     seed -= 1  # record original seed
@@ -3020,6 +3115,8 @@ def main(args):
                     metadata.add_text("negative-scale", str(negative_scale))
                 if clip_prompt is not None:
                     metadata.add_text("clip-prompt", clip_prompt)
+                if raw_prompt is not None:
+                    metadata.add_text("raw-prompt", raw_prompt)
 
                 if args.use_original_file_name and init_images is not None:
                     if type(init_images) is list:
@@ -3042,7 +3139,9 @@ def main(args):
                         cv2.waitKey()
                         cv2.destroyAllWindows()
                 except ImportError:
-                    print("opencv-python is not installed, cannot preview / opencv-pythonがインストールされていないためプレビューできません")
+                    logger.info(
+                        "opencv-python is not installed, cannot preview / opencv-pythonがインストールされていないためプレビューできません"
+                    )
 
             return images
 
@@ -3055,7 +3154,8 @@ def main(args):
                 # interactive
                 valid = False
                 while not valid:
-                    print("\nType prompt:")
+                    logger.info("")
+                    logger.info("Type prompt:")
                     try:
                         raw_prompt = input()
                     except EOFError:
@@ -3096,40 +3196,48 @@ def main(args):
                     ds_timesteps_2 = args.ds_timesteps_2
                     ds_ratio = args.ds_ratio
 
+                    # Gradual Latent
+                    gl_timesteps = None  # means no override
+                    gl_ratio = args.gradual_latent_ratio
+                    gl_every_n_steps = args.gradual_latent_every_n_steps
+                    gl_ratio_step = args.gradual_latent_ratio_step
+                    gl_s_noise = args.gradual_latent_s_noise
+                    gl_unsharp_params = args.gradual_latent_unsharp_params
+
                     prompt_args = raw_prompt.strip().split(" --")
                     prompt = prompt_args[0]
-                    print(f"prompt {prompt_index+1}/{len(prompt_list)}: {prompt}")
+                    logger.info(f"prompt {prompt_index+1}/{len(prompt_list)}: {prompt}")
 
                     for parg in prompt_args[1:]:
                         try:
                             m = re.match(r"w (\d+)", parg, re.IGNORECASE)
                             if m:
                                 width = int(m.group(1))
-                                print(f"width: {width}")
+                                logger.info(f"width: {width}")
                                 continue
 
                             m = re.match(r"h (\d+)", parg, re.IGNORECASE)
                             if m:
                                 height = int(m.group(1))
-                                print(f"height: {height}")
+                                logger.info(f"height: {height}")
                                 continue
 
                             m = re.match(r"s (\d+)", parg, re.IGNORECASE)
                             if m:  # steps
                                 steps = max(1, min(1000, int(m.group(1))))
-                                print(f"steps: {steps}")
+                                logger.info(f"steps: {steps}")
                                 continue
 
                             m = re.match(r"d ([\d,]+)", parg, re.IGNORECASE)
                             if m:  # seed
                                 seeds = [int(d) for d in m.group(1).split(",")]
-                                print(f"seeds: {seeds}")
+                                logger.info(f"seeds: {seeds}")
                                 continue
 
                             m = re.match(r"l ([\d\.]+)", parg, re.IGNORECASE)
                             if m:  # scale
                                 scale = float(m.group(1))
-                                print(f"scale: {scale}")
+                                logger.info(f"scale: {scale}")
                                 continue
 
                             m = re.match(r"nl ([\d\.]+|none|None)", parg, re.IGNORECASE)
@@ -3138,25 +3246,25 @@ def main(args):
                                     negative_scale = None
                                 else:
                                     negative_scale = float(m.group(1))
-                                print(f"negative scale: {negative_scale}")
+                                logger.info(f"negative scale: {negative_scale}")
                                 continue
 
                             m = re.match(r"t ([\d\.]+)", parg, re.IGNORECASE)
                             if m:  # strength
                                 strength = float(m.group(1))
-                                print(f"strength: {strength}")
+                                logger.info(f"strength: {strength}")
                                 continue
 
                             m = re.match(r"n (.+)", parg, re.IGNORECASE)
                             if m:  # negative prompt
                                 negative_prompt = m.group(1)
-                                print(f"negative prompt: {negative_prompt}")
+                                logger.info(f"negative prompt: {negative_prompt}")
                                 continue
 
                             m = re.match(r"c (.+)", parg, re.IGNORECASE)
                             if m:  # clip prompt
                                 clip_prompt = m.group(1)
-                                print(f"clip prompt: {clip_prompt}")
+                                logger.info(f"clip prompt: {clip_prompt}")
                                 continue
 
                             m = re.match(r"am ([\d\.\-,]+)", parg, re.IGNORECASE)
@@ -3164,53 +3272,120 @@ def main(args):
                                 network_muls = [float(v) for v in m.group(1).split(",")]
                                 while len(network_muls) < len(networks):
                                     network_muls.append(network_muls[-1])
-                                print(f"network mul: {network_muls}")
+                                logger.info(f"network mul: {network_muls}")
                                 continue
 
                             # Deep Shrink
                             m = re.match(r"dsd1 ([\d\.]+)", parg, re.IGNORECASE)
                             if m:  # deep shrink depth 1
                                 ds_depth_1 = int(m.group(1))
-                                print(f"deep shrink depth 1: {ds_depth_1}")
+                                logger.info(f"deep shrink depth 1: {ds_depth_1}")
                                 continue
 
                             m = re.match(r"dst1 ([\d\.]+)", parg, re.IGNORECASE)
                             if m:  # deep shrink timesteps 1
                                 ds_timesteps_1 = int(m.group(1))
                                 ds_depth_1 = ds_depth_1 if ds_depth_1 is not None else -1  # -1 means override
-                                print(f"deep shrink timesteps 1: {ds_timesteps_1}")
+                                logger.info(f"deep shrink timesteps 1: {ds_timesteps_1}")
                                 continue
 
                             m = re.match(r"dsd2 ([\d\.]+)", parg, re.IGNORECASE)
                             if m:  # deep shrink depth 2
                                 ds_depth_2 = int(m.group(1))
                                 ds_depth_1 = ds_depth_1 if ds_depth_1 is not None else -1  # -1 means override
-                                print(f"deep shrink depth 2: {ds_depth_2}")
+                                logger.info(f"deep shrink depth 2: {ds_depth_2}")
                                 continue
 
                             m = re.match(r"dst2 ([\d\.]+)", parg, re.IGNORECASE)
                             if m:  # deep shrink timesteps 2
                                 ds_timesteps_2 = int(m.group(1))
                                 ds_depth_1 = ds_depth_1 if ds_depth_1 is not None else -1  # -1 means override
-                                print(f"deep shrink timesteps 2: {ds_timesteps_2}")
+                                logger.info(f"deep shrink timesteps 2: {ds_timesteps_2}")
                                 continue
 
                             m = re.match(r"dsr ([\d\.]+)", parg, re.IGNORECASE)
                             if m:  # deep shrink ratio
                                 ds_ratio = float(m.group(1))
                                 ds_depth_1 = ds_depth_1 if ds_depth_1 is not None else -1  # -1 means override
-                                print(f"deep shrink ratio: {ds_ratio}")
+                                logger.info(f"deep shrink ratio: {ds_ratio}")
+                                continue
+
+                            # Gradual Latent
+                            m = re.match(r"glt ([\d\.]+)", parg, re.IGNORECASE)
+                            if m:  # gradual latent timesteps
+                                gl_timesteps = int(m.group(1))
+                                logger.info(f"gradual latent timesteps: {gl_timesteps}")
+                                continue
+
+                            m = re.match(r"glr ([\d\.]+)", parg, re.IGNORECASE)
+                            if m:  # gradual latent ratio
+                                gl_ratio = float(m.group(1))
+                                gl_timesteps = gl_timesteps if gl_timesteps is not None else -1  # -1 means override
+                                logger.info(f"gradual latent ratio: {ds_ratio}")
+                                continue
+
+                            m = re.match(r"gle ([\d\.]+)", parg, re.IGNORECASE)
+                            if m:  # gradual latent every n steps
+                                gl_every_n_steps = int(m.group(1))
+                                gl_timesteps = gl_timesteps if gl_timesteps is not None else -1  # -1 means override
+                                logger.info(f"gradual latent every n steps: {gl_every_n_steps}")
+                                continue
+
+                            m = re.match(r"gls ([\d\.]+)", parg, re.IGNORECASE)
+                            if m:  # gradual latent ratio step
+                                gl_ratio_step = float(m.group(1))
+                                gl_timesteps = gl_timesteps if gl_timesteps is not None else -1  # -1 means override
+                                logger.info(f"gradual latent ratio step: {gl_ratio_step}")
+                                continue
+
+                            m = re.match(r"glsn ([\d\.]+)", parg, re.IGNORECASE)
+                            if m:  # gradual latent s noise
+                                gl_s_noise = float(m.group(1))
+                                gl_timesteps = gl_timesteps if gl_timesteps is not None else -1  # -1 means override
+                                logger.info(f"gradual latent s noise: {gl_s_noise}")
+                                continue
+
+                            m = re.match(r"glus ([\d\.\-,]+)", parg, re.IGNORECASE)
+                            if m:  # gradual latent unsharp params
+                                gl_unsharp_params = m.group(1)
+                                gl_timesteps = gl_timesteps if gl_timesteps is not None else -1  # -1 means override
+                                logger.info(f"gradual latent unsharp params: {gl_unsharp_params}")
                                 continue
 
                         except ValueError as ex:
-                            print(f"Exception in parsing / 解析エラー: {parg}")
-                            print(ex)
+                            logger.info(f"Exception in parsing / 解析エラー: {parg}")
+                            logger.info(ex)
 
                 # override Deep Shrink
                 if ds_depth_1 is not None:
                     if ds_depth_1 < 0:
                         ds_depth_1 = args.ds_depth_1 or 3
                     unet.set_deep_shrink(ds_depth_1, ds_timesteps_1, ds_depth_2, ds_timesteps_2, ds_ratio)
+
+                # override Gradual Latent
+                if gl_timesteps is not None:
+                    if gl_timesteps < 0:
+                        gl_timesteps = args.gradual_latent_timesteps or 650
+                    if gl_unsharp_params is not None:
+                        unsharp_params = gl_unsharp_params.split(",")
+                        us_ksize, us_sigma, us_strength = [float(v) for v in unsharp_params[:3]]
+                        logger.info(f'{unsharp_params}')
+                        us_target_x = True if len(unsharp_params) < 4 else bool(int(unsharp_params[3]))
+                        us_ksize = int(us_ksize)
+                    else:
+                        us_ksize, us_sigma, us_strength, us_target_x = None, None, None, None
+                    gradual_latent = GradualLatent(
+                        gl_ratio,
+                        gl_timesteps,
+                        gl_every_n_steps,
+                        gl_ratio_step,
+                        gl_s_noise,
+                        us_ksize,
+                        us_sigma,
+                        us_strength,
+                        us_target_x,
+                    )
+                    pipe.set_gradual_latent(gradual_latent)
 
                 # prepare seed
                 if seeds is not None:  # given in prompt
@@ -3222,7 +3397,7 @@ def main(args):
                         if len(predefined_seeds) > 0:
                             seed = predefined_seeds.pop(0)
                         else:
-                            print("predefined seeds are exhausted")
+                            logger.info("predefined seeds are exhausted")
                             seed = None
                     elif args.iter_same_seed:
                         seed = iter_seed
@@ -3232,7 +3407,7 @@ def main(args):
                 if seed is None:
                     seed = random.randint(0, 0x7FFFFFFF)
                 if args.interactive:
-                    print(f"seed: {seed}")
+                    logger.info(f"seed: {seed}")
 
                 # prepare init image, guide image and mask
                 init_image = mask_image = guide_image = None
@@ -3248,7 +3423,7 @@ def main(args):
                         width = width - width % 32
                         height = height - height % 32
                         if width != init_image.size[0] or height != init_image.size[1]:
-                            print(
+                            logger.info(
                                 f"img2img image size is not divisible by 32 so aspect ratio is changed / img2imgの画像サイズが32で割り切れないためリサイズされます。画像が歪みます"
                             )
 
@@ -3264,9 +3439,9 @@ def main(args):
                         guide_image = guide_images[global_step % len(guide_images)]
                 elif args.clip_image_guidance_scale > 0 or args.vgg16_guidance_scale > 0:
                     if prev_image is None:
-                        print("Generate 1st image without guide image.")
+                        logger.info("Generate 1st image without guide image.")
                     else:
-                        print("Use previous image as guide image.")
+                        logger.info("Use previous image as guide image.")
                         guide_image = prev_image
 
                 if regional_network:
@@ -3279,7 +3454,9 @@ def main(args):
 
                 b1 = BatchData(
                     False,
-                    BatchDataBase(global_step, prompt, negative_prompt, seed, init_image, mask_image, clip_prompt, guide_image),
+                    BatchDataBase(
+                        global_step, prompt, negative_prompt, seed, init_image, mask_image, clip_prompt, guide_image, raw_prompt
+                    ),
                     BatchDataExt(
                         width,
                         height,
@@ -3308,22 +3485,31 @@ def main(args):
             process_batch(batch_data, highres_fix)
             batch_data.clear()
 
-    print("done!")
+    logger.info("done!")
 
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--v2", action="store_true", help="load Stable Diffusion v2.0 model / Stable Diffusion 2.0のモデルを読み込む")
+    add_logging_arguments(parser)
+
+    parser.add_argument(
+        "--v2", action="store_true", help="load Stable Diffusion v2.0 model / Stable Diffusion 2.0のモデルを読み込む"
+    )
     parser.add_argument(
         "--v_parameterization", action="store_true", help="enable v-parameterization training / v-parameterization学習を有効にする"
     )
     parser.add_argument("--prompt", type=str, default=None, help="prompt / プロンプト")
     parser.add_argument(
-        "--from_file", type=str, default=None, help="if specified, load prompts from this file / 指定時はプロンプトをファイルから読み込む"
+        "--from_file",
+        type=str,
+        default=None,
+        help="if specified, load prompts from this file / 指定時はプロンプトをファイルから読み込む",
     )
     parser.add_argument(
-        "--interactive", action="store_true", help="interactive mode (generates one image) / 対話モード（生成される画像は1枚になります）"
+        "--interactive",
+        action="store_true",
+        help="interactive mode (generates one image) / 対話モード（生成される画像は1枚になります）",
     )
     parser.add_argument(
         "--no_preview", action="store_true", help="do not show generated image in interactive mode / 対話モードで画像を表示しない"
@@ -3335,7 +3521,9 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strength", type=float, default=None, help="img2img strength / img2img時のstrength")
     parser.add_argument("--images_per_prompt", type=int, default=1, help="number of images per prompt / プロンプトあたりの出力枚数")
     parser.add_argument("--outdir", type=str, default="outputs", help="dir to write results to / 生成画像の出力先")
-    parser.add_argument("--sequential_file_name", action="store_true", help="sequential output file name / 生成画像のファイル名を連番にする")
+    parser.add_argument(
+        "--sequential_file_name", action="store_true", help="sequential output file name / 生成画像のファイル名を連番にする"
+    )
     parser.add_argument(
         "--use_original_file_name",
         action="store_true",
@@ -3389,9 +3577,14 @@ def setup_parser() -> argparse.ArgumentParser:
         default=7.5,
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty)) / guidance scale",
     )
-    parser.add_argument("--ckpt", type=str, default=None, help="path to checkpoint of model / モデルのcheckpointファイルまたはディレクトリ")
     parser.add_argument(
-        "--vae", type=str, default=None, help="path to checkpoint of vae to replace / VAEを入れ替える場合、VAEのcheckpointファイルまたはディレクトリ"
+        "--ckpt", type=str, default=None, help="path to checkpoint of model / モデルのcheckpointファイルまたはディレクトリ"
+    )
+    parser.add_argument(
+        "--vae",
+        type=str,
+        default=None,
+        help="path to checkpoint of vae to replace / VAEを入れ替える場合、VAEのcheckpointファイルまたはディレクトリ",
     )
     parser.add_argument(
         "--tokenizer_cache_dir",
@@ -3427,25 +3620,46 @@ def setup_parser() -> argparse.ArgumentParser:
         help="use xformers by diffusers (Hypernetworks doesn't work) / Diffusersでxformersを使用する（Hypernetwork利用不可）",
     )
     parser.add_argument(
-        "--opt_channels_last", action="store_true", help="set channels last option to model / モデルにchannels lastを指定し最適化する"
+        "--opt_channels_last",
+        action="store_true",
+        help="set channels last option to model / モデルにchannels lastを指定し最適化する",
     )
     parser.add_argument(
-        "--network_module", type=str, default=None, nargs="*", help="additional network module to use / 追加ネットワークを使う時そのモジュール名"
+        "--network_module",
+        type=str,
+        default=None,
+        nargs="*",
+        help="additional network module to use / 追加ネットワークを使う時そのモジュール名",
     )
     parser.add_argument(
         "--network_weights", type=str, default=None, nargs="*", help="additional network weights to load / 追加ネットワークの重み"
     )
-    parser.add_argument("--network_mul", type=float, default=None, nargs="*", help="additional network multiplier / 追加ネットワークの効果の倍率")
     parser.add_argument(
-        "--network_args", type=str, default=None, nargs="*", help="additional arguments for network (key=value) / ネットワークへの追加の引数"
+        "--network_mul", type=float, default=None, nargs="*", help="additional network multiplier / 追加ネットワークの効果の倍率"
     )
-    parser.add_argument("--network_show_meta", action="store_true", help="show metadata of network model / ネットワークモデルのメタデータを表示する")
     parser.add_argument(
-        "--network_merge_n_models", type=int, default=None, help="merge this number of networks / この数だけネットワークをマージする"
+        "--network_args",
+        type=str,
+        default=None,
+        nargs="*",
+        help="additional arguments for network (key=value) / ネットワークへの追加の引数",
     )
-    parser.add_argument("--network_merge", action="store_true", help="merge network weights to original model / ネットワークの重みをマージする")
     parser.add_argument(
-        "--network_pre_calc", action="store_true", help="pre-calculate network for generation / ネットワークのあらかじめ計算して生成する"
+        "--network_show_meta", action="store_true", help="show metadata of network model / ネットワークモデルのメタデータを表示する"
+    )
+    parser.add_argument(
+        "--network_merge_n_models",
+        type=int,
+        default=None,
+        help="merge this number of networks / この数だけネットワークをマージする",
+    )
+    parser.add_argument(
+        "--network_merge", action="store_true", help="merge network weights to original model / ネットワークの重みをマージする"
+    )
+    parser.add_argument(
+        "--network_pre_calc",
+        action="store_true",
+        help="pre-calculate network for generation / ネットワークのあらかじめ計算して生成する",
     )
     parser.add_argument(
         "--network_regional_mask_max_color_codes",
@@ -3467,7 +3681,9 @@ def setup_parser() -> argparse.ArgumentParser:
         nargs="*",
         help="Embeddings files of Extended Textual Inversion / Extended Textual Inversionのembeddings",
     )
-    parser.add_argument("--clip_skip", type=int, default=None, help="layer number from bottom to use in CLIP / CLIPの後ろからn層目の出力を使う")
+    parser.add_argument(
+        "--clip_skip", type=int, default=None, help="layer number from bottom to use in CLIP / CLIPの後ろからn層目の出力を使う"
+    )
     parser.add_argument(
         "--max_embeddings_multiples",
         type=int,
@@ -3508,7 +3724,10 @@ def setup_parser() -> argparse.ArgumentParser:
         help="enable highres fix, reso scale for 1st stage / highres fixを有効にして最初の解像度をこのscaleにする",
     )
     parser.add_argument(
-        "--highres_fix_steps", type=int, default=28, help="1st stage steps for highres fix / highres fixの最初のステージのステップ数"
+        "--highres_fix_steps",
+        type=int,
+        default=28,
+        help="1st stage steps for highres fix / highres fixの最初のステージのステップ数",
     )
     parser.add_argument(
         "--highres_fix_strength",
@@ -3517,7 +3736,9 @@ def setup_parser() -> argparse.ArgumentParser:
         help="1st stage img2img strength for highres fix / highres fixの最初のステージのimg2img時のstrength、省略時はstrengthと同じ",
     )
     parser.add_argument(
-        "--highres_fix_save_1st", action="store_true", help="save 1st stage images for highres fix / highres fixの最初のステージの画像を保存する"
+        "--highres_fix_save_1st",
+        action="store_true",
+        help="save 1st stage images for highres fix / highres fixの最初のステージの画像を保存する",
     )
     parser.add_argument(
         "--highres_fix_latents_upscaling",
@@ -3525,7 +3746,10 @@ def setup_parser() -> argparse.ArgumentParser:
         help="use latents upscaling for highres fix / highres fixでlatentで拡大する",
     )
     parser.add_argument(
-        "--highres_fix_upscaler", type=str, default=None, help="upscaler module for highres fix / highres fixで使うupscalerのモジュール名"
+        "--highres_fix_upscaler",
+        type=str,
+        default=None,
+        help="upscaler module for highres fix / highres fixで使うupscalerのモジュール名",
     )
     parser.add_argument(
         "--highres_fix_upscaler_args",
@@ -3540,14 +3764,21 @@ def setup_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--negative_scale", type=float, default=None, help="set another guidance scale for negative prompt / ネガティブプロンプトのscaleを指定する"
+        "--negative_scale",
+        type=float,
+        default=None,
+        help="set another guidance scale for negative prompt / ネガティブプロンプトのscaleを指定する",
     )
 
     parser.add_argument(
         "--control_net_models", type=str, default=None, nargs="*", help="ControlNet models to use / 使用するControlNetのモデル名"
     )
     parser.add_argument(
-        "--control_net_preps", type=str, default=None, nargs="*", help="ControlNet preprocess to use / 使用するControlNetのプリプロセス名"
+        "--control_net_preps",
+        type=str,
+        default=None,
+        nargs="*",
+        help="ControlNet preprocess to use / 使用するControlNetのプリプロセス名",
     )
     parser.add_argument("--control_net_weights", type=float, default=None, nargs="*", help="ControlNet weights / ControlNetの重み")
     parser.add_argument(
@@ -3585,6 +3816,45 @@ def setup_parser() -> argparse.ArgumentParser:
         "--ds_ratio", type=float, default=0.5, help="Deep Shrink ratio for downsampling / Deep Shrinkのdownsampling比率"
     )
 
+    # gradual latent
+    parser.add_argument(
+        "--gradual_latent_timesteps",
+        type=int,
+        default=None,
+        help="enable Gradual Latent hires fix and apply upscaling from this timesteps / Gradual Latent hires fixをこのtimestepsで有効にし、このtimestepsからアップスケーリングを適用する",
+    )
+    parser.add_argument(
+        "--gradual_latent_ratio",
+        type=float,
+        default=0.5,
+        help=" this size ratio, 0.5 means 1/2 / Gradual Latent hires fixをこのサイズ比率で有効にする、0.5は1/2を意味する",
+    )
+    parser.add_argument(
+        "--gradual_latent_ratio_step",
+        type=float,
+        default=0.125,
+        help="step to increase ratio for Gradual Latent / Gradual Latentのratioをどのくらいずつ上げるか",
+    )
+    parser.add_argument(
+        "--gradual_latent_every_n_steps",
+        type=int,
+        default=3,
+        help="steps to increase size of latents every this steps for Gradual Latent / Gradual Latentでlatentsのサイズをこのステップごとに上げる",
+    )
+    parser.add_argument(
+        "--gradual_latent_s_noise",
+        type=float,
+        default=1.0,
+        help="s_noise for Gradual Latent / Gradual Latentのs_noise",
+    )
+    parser.add_argument(
+        "--gradual_latent_unsharp_params",
+        type=str,
+        default=None,
+        help="unsharp mask parameters for Gradual Latent: ksize, sigma, strength, target-x (1 means True). `3,0.5,0.5,1` or `3,1.0,1.0,0` is recommended /"
+        + " Gradual Latentのunsharp maskのパラメータ: ksize, sigma, strength, target-x. `3,0.5,0.5,1` または `3,1.0,1.0,0` が推奨",
+    )
+
     return parser
 
 
@@ -3592,4 +3862,5 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
+    setup_logging(args, reset=True)
     main(args)
