@@ -5,6 +5,7 @@ import folder_paths
 import random
 from comfy import model_management
 import torch
+from pathlib import Path
 
 #Train data path | 设置训练用模型、图片
 #pretrained_model = "E:\AI-Image\ComfyUI_windows_portable_nvidia_cu121_or_cpu\ComfyUI_windows_portable\ComfyUI\models\checkpoints\MyAnimeModel.ckpt"
@@ -261,6 +262,7 @@ class LoraTraininginComfyAdvanced:
             "networkDropout": ("FLOAT", {"default": 0, "step":0.1}),
             "clip_skip": ("INT", {"default":2, "min":1}),
             "output_dir": ("STRING", {"default":'models/loras'}),
+            "resume":(folder_paths.get_folder_paths())
             },
         }
 
@@ -284,19 +286,10 @@ class LoraTraininginComfyAdvanced:
             unloaded_model = True
         if unloaded_model:
             model_management.soft_empty_cache()
-            
-        #print(model_management.current_loaded_models)
-        #loadedmodel = model_management.LoadedModel()
-        #loadedmodel.model_unload(self, current_loaded_models)
-        
-        #transform backslashes into slashes for user convenience.
-        train_data_dir = data_path.replace( "\\", "/")
-        
-        
-        
+                    
         #ADVANCED parameters initialization
         is_v2_model=0
-        network_moduke="networks.lora"
+        network_module="networks.lora"
         network_dim=32
         network_alpha=32
         resolution = "512,512"
@@ -312,6 +305,8 @@ class LoraTraininginComfyAdvanced:
         
         if v2 == "Yes":
             is_v2_model = 1
+
+        train_data_dir = Path(folder_paths.get_output_directory()) / data_path
         
         network_module = networkmodule
         network_dim = networkdimension
